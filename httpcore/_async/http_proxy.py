@@ -64,6 +64,7 @@ class AsyncHTTPProxy(AsyncConnectionPool):  # pragma: nocover
         ssl_context: ssl.SSLContext | None = None,
         proxy_ssl_context: ssl.SSLContext | None = None,
         max_connections: int | None = 10,
+        max_connections_per_origin: int | None = None,
         max_keepalive_connections: int | None = None,
         keepalive_expiry: float | None = None,
         http1: bool = True,
@@ -91,6 +92,9 @@ class AsyncHTTPProxy(AsyncConnectionPool):  # pragma: nocover
             max_connections: The maximum number of concurrent HTTP connections that
                 the pool should allow. Any attempt to send a request on a pool that
                 would exceed this amount will block until a connection is available.
+            max_connections_per_origin: The maximum number of concurrent HTTP
+                connections that the pool should allow to any single remote origin.
+                If `None` (the default) no per-origin limit is applied.
             max_keepalive_connections: The maximum number of idle HTTP connections
                 that will be maintained in the pool.
             keepalive_expiry: The duration in seconds that an idle HTTP connection
@@ -112,6 +116,7 @@ class AsyncHTTPProxy(AsyncConnectionPool):  # pragma: nocover
         super().__init__(
             ssl_context=ssl_context,
             max_connections=max_connections,
+            max_connections_per_origin=max_connections_per_origin,
             max_keepalive_connections=max_keepalive_connections,
             keepalive_expiry=keepalive_expiry,
             http1=http1,

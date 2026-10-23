@@ -8,10 +8,12 @@ import pytest
 from httpcore import (
     SOCKET_OPTION,
     ConnectionPool,
+    HTTPProxy,
     MockBackend,
     MockStream,
     NetworkStream,
     Origin,
+    PoolTimeout,
     Proxy,
     ProxyError,
 )
@@ -266,6 +268,80 @@ def test_proxy_tunneling_with_auth():
         response = proxy.request("GET", "https://example.com/")
         assert response.status == 200
         assert response.content == b"Hello, world!"
+
+
+
+def test_proxy_max_connections_per_origin():
+    """
+    'HTTPProxy' accepts 'max_connections_per_origin' and limits
+    connections by remote origin, while still allowing other remote origins
+    to obtain connections through the same proxy.
+    """
+    network_backend = MockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    with HTTPProxy(
+        proxy_url="http://localhost:8080/",
+        max_connections_per_origin=1,
+        network_backend=network_backend,
+    ) as proxy:
+        # Hold the single allowed connection to 'example.com'.
+        with proxy.stream("GET", "http://example.com/"):
+            # A second request to the same remote origin waits in the queue.
+            with pytest.raises(PoolTimeout):
+                extensions = {"timeout": {"pool": 0.0001}}
+                proxy.request("GET", "http://example.com/", extensions=extensions)
+
+            # A different remote origin still gets a connection via the proxy.
+            response = proxy.request("GET", "http://other.com/")
+            assert response.status == 200
+            assert response.content == b"Hello, world!"
+
+            info = [repr(c) for c in proxy.connections]
+            assert info == [
+                "<ForwardHTTPConnection ['http://localhost:8080', HTTP/1.1, ACTIVE, Request Count: 1]>",
+                "<ForwardHTTPConnection ['http://localhost:8080', HTTP/1.1, IDLE, Request Count: 1]>",
+            ]
+
+
+
+def test_connection_pool_with_proxy_max_connections_per_origin():
+    """
+    A pool configured with 'proxy=...' also accepts 'max_connections_per_origin'
+    and enforces it against the remote origin of proxied connections.
+    """
+    network_backend = MockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    with ConnectionPool(
+        proxy=Proxy("http://localhost:8080/"),
+        max_connections_per_origin=1,
+        network_backend=network_backend,
+    ) as proxy:
+        with proxy.stream("GET", "http://example.com/"):
+            with pytest.raises(PoolTimeout):
+                extensions = {"timeout": {"pool": 0.0001}}
+                proxy.request("GET", "http://example.com/", extensions=extensions)
+
+            response = proxy.request("GET", "http://other.com/")
+            assert response.status == 200
+            assert response.content == b"Hello, world!"
+
+            assert len(proxy.connections) == 2
 
 
 def test_proxy_headers():

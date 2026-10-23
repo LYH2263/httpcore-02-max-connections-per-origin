@@ -60,6 +60,12 @@ The connection pool instance is also the main point of configuration. Let's take
 * `max_connections`: The maximum number of concurrent HTTP connections that the pool
                      should allow. Any attempt to send a request on a pool that would
                      exceed this amount will block until a connection is available.
+* `max_connections_per_origin`: The maximum number of concurrent HTTP connections that
+                     the pool should allow to any single origin. Defaults to `None`,
+                     meaning no per-origin limit is applied. Idle connections count
+                     towards the limit, and requests to an origin that has reached
+                     the limit wait until a connection to that origin is available.
+                     HTTP/2 requests continue to multiplex over a single connection.
 * `max_keepalive_connections`: The maximum number of idle HTTP connections that will
                                be maintained in the pool.
 * `keepalive_expiry`: The duration in seconds that an idle HTTP connection may be

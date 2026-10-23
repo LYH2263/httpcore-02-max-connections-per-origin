@@ -39,3 +39,13 @@ class Nursery:
 
 def open_nursery() -> Nursery:
     return Nursery()
+
+
+def Event() -> threading.Event:
+    # Mirrors `trio.Event()` (`set()` / `wait()`) in the threaded test backend.
+    return threading.Event()
+
+
+def Lock() -> threading.Lock:
+    # Mirrors `trio.Lock()` (`async with lock:` / `with lock:`) in tests.
+    return threading.Lock()

@@ -189,9 +189,56 @@ def test_socks5_request_incorrect_auth():
         ),
         network_backend=network_backend,
     ) as proxy:
-        # Sending a request, which the proxy rejects
+        # Send a request, which the proxy rejects
         with pytest.raises(httpcore.ProxyError) as exc_info:
             proxy.request("GET", "https://example.com/")
         assert str(exc_info.value) == "Invalid username/password"
 
         assert not proxy.connections
+
+
+
+def test_socks5_max_connections_per_origin():
+    """
+    'SOCKSProxy' accepts 'max_connections_per_origin' and limits
+    connections by remote origin, while still allowing other remote origins
+    to obtain connections through the same SOCKS proxy.
+    """
+    network_backend = httpcore.MockBackend(
+        [
+            # The initial socks CONNECT
+            #   v5 NOAUTH
+            b"\x05\x00",
+            #   v5 SUC RSV IP4 127  .0  .0  .1     :80
+            b"\x05\x00\x00\x01\xff\x00\x00\x01\x00\x50",
+            # The actual response from the remote server
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    with httpcore.SOCKSProxy(
+        proxy_url="socks5://localhost:8080/",
+        max_connections_per_origin=1,
+        network_backend=network_backend,
+    ) as proxy:
+        # Hold the single allowed connection to 'example.com'.
+        with proxy.stream("GET", "http://example.com/"):
+            # A second request to the same remote origin waits in the queue.
+            with pytest.raises(httpcore.PoolTimeout):
+                extensions = {"timeout": {"pool": 0.0001}}
+                proxy.request("GET", "http://example.com/", extensions=extensions)
+
+            # A different remote origin still gets a connection via the proxy.
+            response = proxy.request("GET", "http://other.com/")
+            assert response.status == 200
+            assert response.content == b"Hello, world!"
+
+            info = [repr(c) for c in proxy.connections]
+            assert info == [
+                "<Socks5Connection ['http://example.com:80', HTTP/1.1, ACTIVE, Request Count: 1]>",
+                "<Socks5Connection ['http://other.com:80', HTTP/1.1, IDLE, Request Count: 1]>",
+            ]

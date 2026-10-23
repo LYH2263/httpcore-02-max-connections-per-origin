@@ -50,6 +50,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
         ssl_context: ssl.SSLContext | None = None,
         proxy: Proxy | None = None,
         max_connections: int | None = 10,
+        max_connections_per_origin: int | None = None,
         max_keepalive_connections: int | None = None,
         keepalive_expiry: float | None = None,
         http1: bool = True,
@@ -70,6 +71,13 @@ class AsyncConnectionPool(AsyncRequestInterface):
             max_connections: The maximum number of concurrent HTTP connections that
                 the pool should allow. Any attempt to send a request on a pool that
                 would exceed this amount will block until a connection is available.
+            max_connections_per_origin: The maximum number of concurrent HTTP
+                connections that the pool should allow to any single origin. If
+                `None` (the default) no per-origin limit is applied. When set,
+                requests to an origin that already holds this many connections
+                will block until a connection to that origin is available. The
+                limit counts pool connection entries (including idle ones), not
+                in-flight requests or HTTP/2 streams.
             max_keepalive_connections: The maximum number of idle HTTP connections
                 that will be maintained in the pool.
             keepalive_expiry: The duration in seconds that an idle HTTP connection
@@ -91,6 +99,14 @@ class AsyncConnectionPool(AsyncRequestInterface):
         """
         self._ssl_context = ssl_context
         self._proxy = proxy
+        if max_connections_per_origin is not None and (
+            not isinstance(max_connections_per_origin, int)
+            or max_connections_per_origin < 1
+        ):
+            raise ValueError(
+                "max_connections_per_origin must be an integer greater than or equal to 1"
+            )
+        self._max_connections_per_origin = max_connections_per_origin
         self._max_connections = (
             sys.maxsize if max_connections is None else max_connections
         )
@@ -311,6 +327,18 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 connection for connection in self._connections if connection.is_idle()
             ]
 
+            # The per-origin limit counts every non-closed pool entry for the
+            # request origin, including idle and active connections. Closed
+            # connections have already been removed above.
+            origin_connection_count = sum(
+                connection.can_handle_request(origin)
+                for connection in self._connections
+            )
+            can_create_origin_connection = (
+                self._max_connections_per_origin is None
+                or origin_connection_count < self._max_connections_per_origin
+            )
+
             # There are three cases for how we may be able to handle the request:
             #
             # 1. There is an existing connection that can handle the request.
@@ -321,20 +349,36 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 # log: "reusing existing connection"
                 connection = available_connections[0]
                 pool_request.assign_to_connection(connection)
-            elif len(self._connections) < self._max_connections:
+            elif (
+                can_create_origin_connection
+                and len(self._connections) < self._max_connections
+            ):
                 # log: "creating new connection"
                 connection = self.create_connection(origin)
                 self._connections.append(connection)
                 pool_request.assign_to_connection(connection)
-            elif idle_connections:
-                # log: "closing idle connection"
-                connection = idle_connections[0]
-                self._connections.remove(connection)
-                closing_connections.append(connection)
-                # log: "creating new connection"
-                connection = self.create_connection(origin)
-                self._connections.append(connection)
-                pool_request.assign_to_connection(connection)
+            elif can_create_origin_connection:
+                # The pool is full. Only idle connections belonging to a
+                # different origin may be evicted; we never close an idle
+                # connection to the same origin just to replace it with a
+                # new connection to that origin.
+                if self._max_connections_per_origin is not None:
+                    evictable_connections = [
+                        connection
+                        for connection in idle_connections
+                        if not connection.can_handle_request(origin)
+                    ]
+                else:
+                    evictable_connections = idle_connections
+                if evictable_connections:
+                    # log: "closing idle connection"
+                    connection = evictable_connections[0]
+                    self._connections.remove(connection)
+                    closing_connections.append(connection)
+                    # log: "creating new connection"
+                    connection = self.create_connection(origin)
+                    self._connections.append(connection)
+                    pool_request.assign_to_connection(connection)
 
         return closing_connections
 

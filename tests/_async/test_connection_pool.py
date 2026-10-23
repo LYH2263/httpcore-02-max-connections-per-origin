@@ -777,6 +777,286 @@ async def test_connection_pool_timeout_zero():
 
 
 @pytest.mark.anyio
+async def test_max_connections_per_origin_invalid():
+    """
+    'max_connections_per_origin' must be an integer greater than or equal to 1.
+    """
+    with pytest.raises(ValueError):
+        httpcore.AsyncConnectionPool(max_connections_per_origin=0)
+    with pytest.raises(ValueError):
+        httpcore.AsyncConnectionPool(max_connections_per_origin=-1)
+
+
+@pytest.mark.trio
+async def test_max_connections_per_origin_http11():
+    """
+    With 'max_connections_per_origin' set, the number of non-closed
+    connections to a single origin must not exceed the limit. Once the limit
+    is reached, further requests reuse the existing IDLE connections rather
+    than opening an additional connection.
+    """
+    response_bytes = [
+        b"HTTP/1.1 200 OK\r\n",
+        b"Content-Type: plain/text\r\n",
+        b"Content-Length: 13\r\n",
+        b"\r\n",
+        b"Hello, world!",
+    ]
+
+    # Block new connections until all three have been requested, so that the
+    # pool deterministically holds three concurrent connections regardless of
+    # how the concurrent tasks/threads are scheduled.
+    connect_gate = concurrency.Event()
+    connect_lock = concurrency.Lock()
+    state = {"connections": 0}
+
+    class GatedMockBackend(httpcore.AsyncMockBackend):
+        async def connect_tcp(
+            self,
+            host,
+            port,
+            timeout=None,
+            local_address=None,
+            socket_options=None,
+        ):
+            async with connect_lock:
+                state["connections"] += 1
+                if state["connections"] == 3:
+                    connect_gate.set()
+            await connect_gate.wait()
+            return await super().connect_tcp(
+                host,
+                port,
+                timeout=timeout,
+                local_address=local_address,
+                socket_options=socket_options,
+            )
+
+    network_backend = GatedMockBackend(response_bytes * 2)
+
+    async def fetch(pool, domain, info_list):
+        async with pool.stream("GET", f"http://{domain}/") as response:
+            info_list.append(list(pool.connections))
+            await response.aread()
+
+    origin = httpcore.Origin(b"http", b"a.com", 80)
+
+    async with httpcore.AsyncConnectionPool(
+        max_connections_per_origin=3, network_backend=network_backend
+    ) as pool:
+        info_list: typing.List[typing.List[httpcore.AsyncConnectionInterface]] = []
+        async with concurrency.open_nursery() as nursery:
+            for _ in range(3):
+                nursery.start_soon(fetch, pool, "a.com", info_list)
+
+        # While the requests were in flight the pool never held more than the
+        # allowed number of connections, and all of them were to 'a.com'.
+        for connections in info_list:
+            assert len(connections) <= 3
+            assert all(
+                connection.can_handle_request(origin) for connection in connections
+            )
+
+        # The three completed connections are kept alive as IDLE connections.
+        info = [repr(c) for c in pool.connections]
+        assert len(info) == 3
+        assert info == [
+            "<AsyncHTTPConnection ['http://a.com:80', HTTP/1.1, IDLE, Request Count: 1]>",
+            "<AsyncHTTPConnection ['http://a.com:80', HTTP/1.1, IDLE, Request Count: 1]>",
+            "<AsyncHTTPConnection ['http://a.com:80', HTTP/1.1, IDLE, Request Count: 1]>",
+        ]
+
+        # A fourth request reuses one of the IDLE connections, and does not
+        # open a fourth connection to the origin.
+        response = await pool.request("GET", "http://a.com/")
+        assert response.status == 200
+        assert response.content == b"Hello, world!"
+
+        info = [repr(c) for c in pool.connections]
+        assert len(info) == 3
+        assert sum("Request Count: 2" in entry for entry in info) == 1
+        assert sum("Request Count: 1" in entry for entry in info) == 2
+
+
+@pytest.mark.trio
+async def test_max_connections_per_origin_http2():
+    """
+    Under HTTP/2 a single available connection services multiple requests.
+    The per-origin limit counts connections, not streams, so any number of
+    concurrent requests must share the single HTTP/2 connection.
+    """
+    network_backend = httpcore.AsyncMockBackend(
+        buffer=[
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode(
+                    [
+                        (b":status", b"200"),
+                        (b"content-type", b"plain/text"),
+                    ]
+                ),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(
+                stream_id=1, data=b"Hello, world!", flags=["END_STREAM"]
+            ).serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=3,
+                data=hpack.Encoder().encode(
+                    [
+                        (b":status", b"200"),
+                        (b"content-type", b"plain/text"),
+                    ]
+                ),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(
+                stream_id=3, data=b"Hello, world!", flags=["END_STREAM"]
+            ).serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=5,
+                data=hpack.Encoder().encode(
+                    [
+                        (b":status", b"200"),
+                        (b"content-type", b"plain/text"),
+                    ]
+                ),
+                flags=["END_HEADERS"],
+            ).serialize(),
+            hyperframe.frame.DataFrame(
+                stream_id=5, data=b"Hello, world!", flags=["END_STREAM"]
+            ).serialize(),
+        ],
+        http2=True,
+    )
+
+    async def fetch(pool, domain, info_list):
+        async with pool.stream("GET", f"https://{domain}/") as response:
+            info_list.append(list(pool.connections))
+            await response.aread()
+
+    origin = httpcore.Origin(b"https", b"a.com", 443)
+
+    async with httpcore.AsyncConnectionPool(
+        http2=True, max_connections_per_origin=1, network_backend=network_backend
+    ) as pool:
+        info_list: typing.List[typing.List[httpcore.AsyncConnectionInterface]] = []
+        async with concurrency.open_nursery() as nursery:
+            for _ in range(3):
+                nursery.start_soon(fetch, pool, "a.com", info_list)
+
+        # All the concurrent requests multiplexed onto a single connection.
+        for connections in info_list:
+            assert len(connections) == 1
+            assert connections[0].can_handle_request(origin)
+
+        info = [repr(c) for c in pool.connections]
+        assert info == [
+            "<AsyncHTTPConnection ['https://a.com:443', HTTP/2, IDLE, Request Count: 3]>"
+        ]
+
+
+@pytest.mark.anyio
+async def test_max_connections_per_origin_other_origin_proceeds():
+    """
+    When one origin has reached its per-origin limit, requests to other
+    origins must still be able to obtain connections, while requests to the
+    saturated origin wait in the queue and may fail on the pool timeout.
+    """
+    network_backend = httpcore.AsyncMockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    async with httpcore.AsyncConnectionPool(
+        max_connections=5,
+        max_connections_per_origin=1,
+        network_backend=network_backend,
+    ) as pool:
+        # Hold a single connection to 'a.com' open and active.
+        async with pool.stream("GET", "http://a.com/"):
+            # A second request to 'a.com' cannot open another connection,
+            # and times out waiting in the queue.
+            with pytest.raises(httpcore.PoolTimeout):
+                extensions = {"timeout": {"pool": 0.0001}}
+                await pool.request("GET", "http://a.com/", extensions=extensions)
+
+            # Requests to a different origin are unaffected and complete.
+            response = await pool.request("GET", "http://b.com/")
+            assert response.status == 200
+            assert response.content == b"Hello, world!"
+
+            info = [repr(c) for c in pool.connections]
+            assert info == [
+                "<AsyncHTTPConnection ['http://a.com:80', HTTP/1.1, ACTIVE, Request Count: 1]>",
+                "<AsyncHTTPConnection ['http://b.com:80', HTTP/1.1, IDLE, Request Count: 1]>",
+            ]
+
+
+@pytest.mark.anyio
+async def test_max_connections_per_origin_no_idle_eviction():
+    """
+    A request blocked on the per-origin limit must not evict IDLE connections
+    to force a new connection for its origin. Requests to other origins may
+    still evict IDLE connections belonging to other origins as usual.
+    """
+    network_backend = httpcore.AsyncMockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    async with httpcore.AsyncConnectionPool(
+        max_connections=2,
+        max_connections_per_origin=1,
+        network_backend=network_backend,
+    ) as pool:
+        # A completed request leaves an IDLE connection to 'c.com'.
+        response = await pool.request("GET", "http://c.com/")
+        assert response.status == 200
+
+        # Hold a single active connection to 'a.com'. The pool is now full.
+        async with pool.stream("GET", "http://a.com/"):
+            info = [repr(c) for c in pool.connections]
+            assert info == [
+                "<AsyncHTTPConnection ['http://c.com:80', HTTP/1.1, IDLE, Request Count: 1]>",
+                "<AsyncHTTPConnection ['http://a.com:80', HTTP/1.1, ACTIVE, Request Count: 1]>",
+            ]
+
+            # A second request to 'a.com' cannot evict the IDLE connection to
+            # 'c.com' in order to force a new connection to 'a.com'.
+            with pytest.raises(httpcore.PoolTimeout):
+                extensions = {"timeout": {"pool": 0.0001}}
+                await pool.request("GET", "http://a.com/", extensions=extensions)
+
+            # The IDLE connection to 'c.com' is still present.
+            info = [repr(c) for c in pool.connections]
+            assert any("http://c.com:80" in entry for entry in info)
+
+            # A request to 'b.com' may evict the IDLE connection to 'c.com'
+            # and establish a new connection.
+            response = await pool.request("GET", "http://b.com/")
+            assert response.status == 200
+            assert response.content == b"Hello, world!"
+
+            info = [repr(c) for c in pool.connections]
+            assert info == [
+                "<AsyncHTTPConnection ['http://a.com:80', HTTP/1.1, ACTIVE, Request Count: 1]>",
+                "<AsyncHTTPConnection ['http://b.com:80', HTTP/1.1, IDLE, Request Count: 1]>",
+            ]
+
+
+@pytest.mark.anyio
 async def test_http11_upgrade_connection():
     """
     HTTP "101 Switching Protocols" indicates an upgraded connection.

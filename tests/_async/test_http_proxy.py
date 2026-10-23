@@ -8,10 +8,12 @@ import pytest
 from httpcore import (
     SOCKET_OPTION,
     AsyncConnectionPool,
+    AsyncHTTPProxy,
     AsyncMockBackend,
     AsyncMockStream,
     AsyncNetworkStream,
     Origin,
+    PoolTimeout,
     Proxy,
     ProxyError,
 )
@@ -266,6 +268,80 @@ async def test_proxy_tunneling_with_auth():
         response = await proxy.request("GET", "https://example.com/")
         assert response.status == 200
         assert response.content == b"Hello, world!"
+
+
+@pytest.mark.anyio
+async def test_proxy_max_connections_per_origin():
+    """
+    'AsyncHTTPProxy' accepts 'max_connections_per_origin' and limits
+    connections by remote origin, while still allowing other remote origins
+    to obtain connections through the same proxy.
+    """
+    network_backend = AsyncMockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    async with AsyncHTTPProxy(
+        proxy_url="http://localhost:8080/",
+        max_connections_per_origin=1,
+        network_backend=network_backend,
+    ) as proxy:
+        # Hold the single allowed connection to 'example.com'.
+        async with proxy.stream("GET", "http://example.com/"):
+            # A second request to the same remote origin waits in the queue.
+            with pytest.raises(PoolTimeout):
+                extensions = {"timeout": {"pool": 0.0001}}
+                await proxy.request("GET", "http://example.com/", extensions=extensions)
+
+            # A different remote origin still gets a connection via the proxy.
+            response = await proxy.request("GET", "http://other.com/")
+            assert response.status == 200
+            assert response.content == b"Hello, world!"
+
+            info = [repr(c) for c in proxy.connections]
+            assert info == [
+                "<AsyncForwardHTTPConnection ['http://localhost:8080', HTTP/1.1, ACTIVE, Request Count: 1]>",
+                "<AsyncForwardHTTPConnection ['http://localhost:8080', HTTP/1.1, IDLE, Request Count: 1]>",
+            ]
+
+
+@pytest.mark.anyio
+async def test_connection_pool_with_proxy_max_connections_per_origin():
+    """
+    A pool configured with 'proxy=...' also accepts 'max_connections_per_origin'
+    and enforces it against the remote origin of proxied connections.
+    """
+    network_backend = AsyncMockBackend(
+        [
+            b"HTTP/1.1 200 OK\r\n",
+            b"Content-Type: plain/text\r\n",
+            b"Content-Length: 13\r\n",
+            b"\r\n",
+            b"Hello, world!",
+        ]
+    )
+
+    async with AsyncConnectionPool(
+        proxy=Proxy("http://localhost:8080/"),
+        max_connections_per_origin=1,
+        network_backend=network_backend,
+    ) as proxy:
+        async with proxy.stream("GET", "http://example.com/"):
+            with pytest.raises(PoolTimeout):
+                extensions = {"timeout": {"pool": 0.0001}}
+                await proxy.request("GET", "http://example.com/", extensions=extensions)
+
+            response = await proxy.request("GET", "http://other.com/")
+            assert response.status == 200
+            assert response.content == b"Hello, world!"
+
+            assert len(proxy.connections) == 2
 
 
 def test_proxy_headers():
